@@ -1,7 +1,1 @@
-{
-  "name": "lexo-bot",
-  "version": "1.0.0",
-  "private": true,
-  "main": "bot.js",
-  "scripts": { "start": "node bot.js" }
-}
+{"name":"lexo-render","version":"1.0.0","private":true,"type":"commonjs","scripts":{"start":"node bot.js"},"engines":{"node":">=20"},"dependencies":{"pg":"^8.16.3"}}
