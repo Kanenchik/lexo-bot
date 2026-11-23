@@ -114,7 +114,7 @@ const server = http.createServer(async (req,res)=>{
     catch { return reply(400,{error:'Некорректный JSON.'}); }
     return reply(200,await api(match[1],user,body,telegram));
   } catch (err) {
-    if (!err.status) console.error('API:',err.code || err.name);
+    if (!err.status) console.error('API:',err.code || err.name, ['password authentication failed','tenant or user not found','timeout','timed out','invalid url','self-signed certificate','connection terminated','ssl','invalid port','client password must be a string'].find(reason=>String(err.message).toLowerCase().includes(reason)) || 'unknown',err.cause?.code || '');
     reply(err.status || 503,{error:err.status ? err.message : 'Сервис временно недоступен. Попробуйте ещё раз.'});
   }
 });
