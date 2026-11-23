@@ -13,7 +13,7 @@ const fs = require('fs');
 const path = require('path');
 
 const TOKEN = process.env.BOT_TOKEN || '';
-const WEB_APP_URL = process.env.WEB_APP_URL || 'https://your-app.vercel.app';
+const WEB_APP_URL = process.env.WEB_APP_URL || 'https://lexo-11.vercel.app';
 const PORT = Number(process.env.PORT || 8787);
 const DAYS = 30;
 const PRICES = {
