@@ -53,7 +53,13 @@ async function addFeedback(c,id,kind,body) {
   return ticket;
 }
 const themes = { night:'Dark',ocean:'Ocean',mango:'Mango',tropics:'Tropics' };
+async function getPrices() {
+  const {rows} = await db.query('SELECT plan,stars FROM public.lexo_prices');
+  return Object.fromEntries(rows.map(({plan,stars})=>[plan,stars]));
+}
+
 async function api(route,u,b,tg) {
+  if (route === 'prices') return getPrices();
   const result = await transaction(async c=>{
     const p = await profile(c,u), id = p.id;
     if (route === 'session') {
@@ -77,6 +83,8 @@ async function api(route,u,b,tg) {
       return r;
     }
     if (route === 'plus') {
+      const {rows:[price]} = await c.query("SELECT stars FROM public.lexo_prices WHERE plan='plus' FOR SHARE");
+      if (price.stars!==0) fail(409,'Plus теперь платный. Откройте актуальные тарифы через /plan в чате бота.');
       await c.query(`UPDATE public.lexo_access SET plus_until=now()+interval '30 days'
         WHERE profile_id=$1 AND (plus_until IS NULL OR plus_until<=now())`,[id]);
     } else if (route === 'promo') {
@@ -94,23 +102,31 @@ async function api(route,u,b,tg) {
       }
       await c.query("UPDATE public.lexo_access SET plus_until=greatest(now(),plus_until)+$2*interval '24 hours' WHERE profile_id=$1",[id,promo.days]);
     } else if (route === 'invoice') {
-      const {rows:[order]} = await c.query('INSERT INTO public.lexo_orders(profile_id) VALUES($1) RETURNING id',[id]);
+      const tier = b.plan ?? 'pro';
+      const expected = b.stars ?? (b.plan == null ? 1 : null);
+      if (!['plus','pro'].includes(tier) || !Number.isInteger(expected) || expected<1)
+        fail(400,'Не удалось подтвердить цену. Откройте тарифы заново.');
+      const {rows:[order]} = await c.query(`INSERT INTO public.lexo_orders(profile_id,plan,stars)
+        SELECT $1,plan,stars FROM public.lexo_prices WHERE plan=$2 AND stars=$3
+        RETURNING id,plan,stars`,[id,tier,expected]);
+      if (!order) fail(409,'Цена изменилась. Откройте тарифы заново.');
       return order;
     } else if (route === 'feedback') return addFeedback(c,id,b.kind,b.body);
     else if (route !== 'plan') fail(404,'Страница не найдена.');
     return plan(c,id);
   });
   if (route !== 'invoice') return result;
-  return {url:await tg('createInvoiceLink',{title:'LEXO Pro',description:'Доступ на 30 дней. Разовая покупка.',payload:result.id,
-    provider_token:'',currency:'XTR',prices:[{label:'LEXO Pro · 30 дней',amount:1}]})};
+  const title = result.plan==='plus'?'LEXO Plus':'LEXO Pro';
+  return {url:await tg('createInvoiceLink',{title,description:'Доступ на 30 дней. Разовая покупка.',payload:result.id,
+    provider_token:'',currency:'XTR',prices:[{label:title+' · 30 дней',amount:result.stars}]})};
 }
 
 async function payment(userId,p,success) {
-  if (p.currency!=='XTR' || p.total_amount!==1 || !/^[0-9a-f-]{36}$/.test(p.invoice_payload || '')) return false;
+  if (p.currency!=='XTR' || !/^[0-9a-f-]{36}$/.test(p.invoice_payload || '')) return false;
   return transaction(async c=>{
     const {rows:[o]} = await c.query(`SELECT o.* FROM public.lexo_orders o JOIN public.profiles p ON p.id=o.profile_id
       WHERE o.id=$1 AND p.telegram_id=$2 FOR UPDATE OF o`,[p.invoice_payload,userId]);
-    if (!o) return false;
+    if (!o || p.total_amount!==o.stars) return false;
     if (!success) {
       if (o.charge || !p.id || Date.now()-Number(o.created_at)>=3600000 || (o.checkout_id && o.checkout_id!==p.id)) return false;
       await c.query('UPDATE public.lexo_orders SET checkout_id=$2 WHERE id=$1',[o.id,p.id]);
@@ -119,7 +135,8 @@ async function payment(userId,p,success) {
     if (o.charge) return o.charge===p.telegram_payment_charge_id;
     if (!p.telegram_payment_charge_id) return false;
     await c.query('UPDATE public.lexo_orders SET charge=$2,paid_at=now() WHERE id=$1',[o.id,p.telegram_payment_charge_id]);
-    await c.query("UPDATE public.lexo_access SET pro_until=greatest(now(),pro_until)+interval '30 days' WHERE profile_id=$1",[o.profile_id]);
+    const expiry = o.plan==='plus'?'plus_until':'pro_until';
+    await c.query(`UPDATE public.lexo_access SET ${expiry}=greatest(now(),${expiry})+interval '30 days' WHERE profile_id=$1`,[o.profile_id]);
     return true;
   });
 }
@@ -134,5 +151,6 @@ async function deliver(tg,admin) {
     await c.query('UPDATE public.lexo_feedback SET delivered_at=now() WHERE id=$1',[r.id]);
   });
 }
-module.exports = {authenticate,api,payment,deliver,db};
+module.exports = {authenticate,api,payment,deliver,db,getPrices};
+
 

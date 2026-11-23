@@ -1,6 +1,6 @@
 const http = require('node:http');
 const {createHmac,timingSafeEqual} = require('node:crypto');
-const { authenticate, api, payment, deliver, db } = require('./service');
+const { authenticate, api, payment, deliver, db, getPrices } = require('./service');
 const TOKEN = process.env.BOT_TOKEN;
 const PORT = Number(process.env.PORT || 8787);
 const WEB_APP_URL = 'https://lexo-11.vercel.app';
@@ -35,7 +35,7 @@ const send = (chatId, text, keyboard = menu) => telegram('sendMessage', {
 const adminMenu = [
   [{text:'📊 Статистика',callback_data:'admin:stats'},{text:'🎟 Промокоды',callback_data:'admin:promos'}],
   [{text:'📬 Обращения',callback_data:'admin:feedback:open:0'},{text:'📈 Активность',callback_data:'admin:activity'}],
-  [{text:'➕ Создать промокод',callback_data:'admin:create'}]
+  [{text:'➕ Создать промокод',callback_data:'admin:create'},{text:'💳 Тарифы',callback_data:'admin:prices'}]
 ];
 
 
@@ -97,7 +97,58 @@ function expiryFromDate(value) {
   return new Date(date.getTime() + 21*60*60*1000);
 }
 
+const priceLabel = value => value === 0 ? 'бесплатно' : value+' ⭐';
+
+async function showPrices(chatId, admin = false) {
+  const prices = await getPrices();
+  const text = ['💳 Тарифы LEXO на 30 дней','Plus — '+priceLabel(prices.plus),'Pro — '+priceLabel(prices.pro)].join('\n');
+  if (admin) return send(chatId,text+'\n\nИзменить цену: /price plus 99 или /price pro 199.\nДля бесплатного Plus укажи /price plus 0.',adminMenu);
+  const choices = ['plus','pro'].map(tier=>[{
+    text:(tier==='plus'?'Plus':'Pro')+' · '+priceLabel(prices[tier]),
+    callback_data:'purchase:'+tier+':'+prices[tier]
+  }]);
+  return send(chatId,text+'\nПлатёж разовый, без автопродления.',[...choices,[openButton]]);
+}
+
+async function preparePrice(chatId, args) {
+  const [tier,raw] = args;
+  if (args.length!==2 || !['plus','pro'].includes(tier) || !/^\d{1,5}$/.test(raw) ||
+      Number(raw)>10000 || (tier==='pro' && Number(raw)===0)) {
+    return send(chatId,'Пример: /price plus 99 или /price pro 199. Для Plus доступен 0, для Pro минимум 1 ⭐.',adminMenu);
+  }
+  const current = (await getPrices())[tier];
+  const next = Number(raw);
+  if (current===next) return showPrices(chatId,true);
+  return send(chatId,tier.toUpperCase()+': '+priceLabel(current)+' → '+priceLabel(next)+'. Применить к новым покупкам?',
+    [[{text:'Подтвердить',callback_data:'admin:price_set:'+tier+':'+current+':'+next}],
+     [{text:'Назад',callback_data:'admin:prices'}]]);
+}
+
+async function confirmPrice(chatId, tier, current, next) {
+  const result = await db.query('UPDATE public.lexo_prices SET stars=$3 WHERE plan=$1 AND stars=$2',[tier,current,next]);
+  if (!result.rowCount) return send(chatId,'Цена уже изменилась. Открой актуальные тарифы.',adminMenu);
+  return showPrices(chatId,true);
+}
+
+async function purchaseInChat(user, chatId, tier, stars) {
+  try {
+    if (tier==='plus' && stars===0) {
+      await api('plus',user,{},telegram);
+      return send(chatId,'Бесплатный Plus активирован.',[[openButton]]);
+    }
+    const {url} = await api('invoice',user,{plan:tier,stars},telegram);
+    return send(chatId,'Счёт LEXO на '+stars+' ⭐. После подтверждения Telegram доступ появится в приложении.',
+      [[{text:'Оплатить '+stars+' ⭐',url}],[openButton]]);
+  } catch (err) {
+    if (err.status) return send(chatId,err.message,[[{text:'Обновить тарифы',callback_data:'purchase:menu'}]]);
+    throw err;
+  }
+}
+
 async function adminCallback(chatId, data) {
+  if (data==='admin:prices') return showPrices(chatId,true);
+  const change = /^admin:price_set:(plus|pro):(\d{1,5}):(\d{1,5})$/.exec(data);
+  if (change) return confirmPrice(chatId,change[1],Number(change[2]),Number(change[3]));
   const [,action,arg,rawPage] = data.split(':');
   if (['stats','promos','create','menu'].includes(action)) return adminAction(chatId,action);
   if (action==='activity') return lessonActivity(chatId);
@@ -265,6 +316,9 @@ async function handle(update) {
       if (isAdmin(callback.from,chat)) return adminCallback(chat.id,callback.data);
       return;
     }
+    if (callback.data==='purchase:menu') return showPrices(chat.id);
+    const purchase = /^purchase:(plus|pro):(\d{1,5})$/.exec(callback.data || '');
+    if (purchase) return purchaseInChat(callback.from,chat.id,purchase[1],Number(purchase[2]));
     if (callback.data==='invite') return sendInvite(chat.id);
     if (callback.data==='lesson:tomorrow') return lessonReminder(chat.id,false);
     if (callback.data==='lesson:cancel') return lessonReminder(chat.id,true);
@@ -294,6 +348,9 @@ async function handle(update) {
     case '/invite': return sendInvite(chatId);
     case '/remind': return lessonReminder(chatId,false);
     case '/remind_cancel': return lessonReminder(chatId,true);
+    case '/price':
+      if (isAdmin(message.from,message.chat)) return preparePrice(chatId,args);
+      return;
     case '/admin':
       if (isAdmin(message.from,message.chat)) return adminAction(chatId,'menu');
       return;
@@ -317,7 +374,7 @@ async function handle(update) {
     case '/myid': return send(chatId,'ID этого чата: '+chatId);
     case '/word': return sendWord(chatId);
     case '/help': return send(chatId,'🦎 /start — открыть LEXO\n/word — слово дня\n/invite — личная ссылка\n/remind — напомнить завтра\n/remind_cancel — отменить напоминание\n/channel — канал LEXO\n/plan — подписки\n/paysupport — помощь с оплатой');
-    case '/plan': return send(chatId,'В LEXO Plus доступен бесплатно, Pro — за 1 ⭐ на 30 дней. Откройте приложение и выберите подписку.');
+    case '/plan': return showPrices(chatId);
     default: return send(chatId,'🦎 Привет! Я Лекс. Практикуй английский в Mini App или попробуй задание дня прямо здесь.');
   }
 }
@@ -336,7 +393,7 @@ const server = http.createServer(async (req,res)=>{
       await db.query('SELECT 1 FROM public.lexo_orders LIMIT 0');
       return reply(200,{ok:true});
     }
-    const match = /^\/api\/(session|plan|progress|plus|promo|invoice|feedback)$/.exec(req.url);
+    const match = /^\/api\/(session|plan|progress|plus|promo|invoice|feedback|prices)$/.exec(req.url);
     if (req.method!=='POST' || !match) return reply(404,{error:'Страница не найдена.'});
     const user = authenticate((req.headers.authorization || '').replace(/^tma /,''),TOKEN);
     const chunks = [];
@@ -395,4 +452,5 @@ if (require.main === module) {
   start().catch(error=>{ console.error(error.message); process.exit(1); });
 }
 module.exports = { handle, server };
+
 
