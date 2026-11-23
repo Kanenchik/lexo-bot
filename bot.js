@@ -1,4 +1,5 @@
 const http = require('node:http');
+const {createHmac,timingSafeEqual} = require('node:crypto');
 const { authenticate, api, payment, deliver, db } = require('./service');
 const TOKEN = process.env.BOT_TOKEN;
 const PORT = Number(process.env.PORT || 8787);
@@ -10,7 +11,7 @@ async function telegram(method, payload = {}) {
     body:JSON.stringify(payload), signal:AbortSignal.timeout(35000)
   });
   const data = await response.json();
-  if (!data.ok) throw new Error(`${method}: ${data.description}`);
+  if (!data.ok) throw Object.assign(new Error(`${method}: ${data.description}`),{telegramCode:data.error_code});
   return data.result;
 }
 
@@ -25,7 +26,7 @@ const exercises = [
 ];
 const openButton = { text:'▶️ Открыть LEXO', web_app:{ url:WEB_APP_URL } };
 const channelButton = { text:'📢 Канал LEXO', url:'https://t.me/lexo_english' };
-const menu = [[openButton], [{ text:'🧩 Слово дня', callback_data:'word' }], [channelButton]];
+const menu = [[openButton], [{ text:'🧩 Слово дня', callback_data:'word' }], [{text:'🔗 Пригласить друга',callback_data:'invite'},{text:'⏰ Напомнить завтра',callback_data:'lesson:tomorrow'}], [channelButton]];
 const send = (chatId, text, keyboard = menu) => telegram('sendMessage', {
   chat_id:chatId, text, reply_markup:{ inline_keyboard:keyboard }
 });
@@ -167,6 +168,78 @@ async function adminAction(chatId, action, args = []) {
   }
 }
 
+
+const cancelReminder = {text:'Отменить напоминание',callback_data:'lesson:cancel'};
+let botUsername;
+
+function referralSignature(id) {
+  return createHmac('sha256',TOKEN).update('lexo-referral:'+id).digest('hex').slice(0,24);
+}
+
+async function sendInvite(chatId) {
+  if (!botUsername) botUsername = (await telegram('getMe')).username;
+  const link = 'https://t.me/'+botUsername+'?start=ref_'+chatId+'_'+referralSignature(chatId);
+  const {rows:[stats]} = await db.query(`SELECT count(*) AS opened,
+    count(p.id) AS registered,
+    count(*) FILTER (WHERE u.lessons_completed>0) AS learned
+    FROM public.lexo_referrals r LEFT JOIN public.profiles p ON p.telegram_id=r.invited_id
+    LEFT JOIN public.user_progress u ON u.profile_id=p.id WHERE r.inviter_id=$1`,[chatId]);
+  const share = 'https://t.me/share/url?'+new URLSearchParams({url:link,text:'Попробуй LEXO — английский в Telegram 🦎'});
+  return send(chatId,['Твоя ссылка для приглашения',link,'',
+    'Запустили бота: '+stats.opened,'Создали профиль: '+stats.registered,'Завершили первый урок: '+stats.learned].join('\n'),
+    [[{text:'Поделиться ссылкой',url:share}]]);
+}
+
+async function rememberReferral(chatId, payload) {
+  const match = /^ref_([1-9]\d{0,15})_([0-9a-f]{24})$/.exec(payload || '');
+  if (!match || String(chatId)===match[1] ||
+      !timingSafeEqual(Buffer.from(match[2]),Buffer.from(referralSignature(match[1])))) return;
+  await db.query(`INSERT INTO public.lexo_referrals(invited_id,inviter_id)
+    SELECT $1,$2 WHERE NOT EXISTS (SELECT 1 FROM public.profiles WHERE telegram_id=$1)
+    ON CONFLICT (invited_id) DO NOTHING`,[chatId,match[1]]);
+}
+
+async function lessonReminder(chatId, cancel) {
+  if (cancel) {
+    const result = await db.query('DELETE FROM public.lexo_lesson_reminders WHERE chat_id=$1',[chatId]);
+    return send(chatId,result.rowCount?'Напоминание отменено.':'Запланированных напоминаний нет.');
+  }
+  const {rows:[row]} = await db.query(`WITH tomorrow AS (
+    SELECT (((now() AT TIME ZONE 'Europe/Moscow')::date + 1) + time '19:00') AT TIME ZONE 'Europe/Moscow' AS due
+  )
+  INSERT INTO public.lexo_lesson_reminders(chat_id,due_at,retry_at)
+  SELECT $1,due,due FROM tomorrow
+  ON CONFLICT(chat_id) DO UPDATE SET due_at=excluded.due_at,retry_at=excluded.retry_at
+  RETURNING due_at`,[chatId]);
+  return send(chatId,'⏰ Напомню '+moscowDate.format(row.due_at)+' МСК.',[[cancelReminder]]);
+}
+
+async function deliverLessonReminders() {
+  try {
+    const {rows} = await db.query(`WITH due AS (
+      SELECT chat_id FROM public.lexo_lesson_reminders
+      WHERE retry_at<=now() AND due_at>=now()-interval '12 hours'
+      ORDER BY retry_at LIMIT 10 FOR UPDATE SKIP LOCKED
+    ) UPDATE public.lexo_lesson_reminders r SET retry_at=now()+interval '5 minutes'
+      FROM due WHERE r.chat_id=due.chat_id RETURNING r.chat_id,r.due_at`);
+    await Promise.all(rows.map(async row=>{
+      try {
+        await send(row.chat_id,'🦎 Время для английского! Открой LEXO и продолжи урок.',[[openButton]]);
+      } catch (err) {
+        if (err.telegramCode!==403) {
+          console.error('Lesson reminder delivery:',err.telegramCode || err.name);
+          return;
+        }
+      }
+      await db.query('DELETE FROM public.lexo_lesson_reminders WHERE chat_id=$1 AND due_at=$2',[row.chat_id,row.due_at]);
+    }));
+  } catch (err) {
+    console.error('Lesson reminder worker:',err.code || err.name);
+  } finally {
+    setTimeout(deliverLessonReminders,15000);
+  }
+}
+
 function sendWord(chatId) {
   const date = new Intl.DateTimeFormat('sv-SE', { timeZone:'Europe/Moscow' }).format(new Date());
   const day = Date.parse(date + 'T00:00:00Z') / 86400000;
@@ -192,6 +265,9 @@ async function handle(update) {
       if (isAdmin(callback.from,chat)) return adminCallback(chat.id,callback.data);
       return;
     }
+    if (callback.data==='invite') return sendInvite(chat.id);
+    if (callback.data==='lesson:tomorrow') return lessonReminder(chat.id,false);
+    if (callback.data==='lesson:cancel') return lessonReminder(chat.id,true);
     if (callback.data === 'word') return sendWord(chat.id);
     const match = /^word:([0-6]):([0-2])$/.exec(callback.data || '');
     if (!match) return;
@@ -212,6 +288,12 @@ async function handle(update) {
   const chatId = message.chat.id;
   const [command, ...args] = message.text.trim().split(/\s+/);
   switch (command.split('@')[0]) {
+    case '/start':
+      await rememberReferral(chatId,args[0]);
+      return send(chatId,'🦎 Привет! Я Лекс. Открой Mini App или попробуй задание дня прямо здесь.');
+    case '/invite': return sendInvite(chatId);
+    case '/remind': return lessonReminder(chatId,false);
+    case '/remind_cancel': return lessonReminder(chatId,true);
     case '/admin':
       if (isAdmin(message.from,message.chat)) return adminAction(chatId,'menu');
       return;
@@ -234,7 +316,7 @@ async function handle(update) {
     }
     case '/myid': return send(chatId,'ID этого чата: '+chatId);
     case '/word': return sendWord(chatId);
-    case '/help': return send(chatId,'🦎 /start — открыть LEXO\n/word — слово дня\n/channel — канал LEXO\n/plan — подписки\n/paysupport — помощь с оплатой');
+    case '/help': return send(chatId,'🦎 /start — открыть LEXO\n/word — слово дня\n/invite — личная ссылка\n/remind — напомнить завтра\n/remind_cancel — отменить напоминание\n/channel — канал LEXO\n/plan — подписки\n/paysupport — помощь с оплатой');
     case '/plan': return send(chatId,'В LEXO Plus доступен бесплатно, Pro — за 1 ⭐ на 30 дней. Откройте приложение и выберите подписку.');
     default: return send(chatId,'🦎 Привет! Я Лекс. Практикуй английский в Mini App или попробуй задание дня прямо здесь.');
   }
@@ -309,6 +391,7 @@ if (require.main === module) {
   if (!process.env.DATABASE_URL) throw new Error('Укажите DATABASE_URL');
   server.listen(PORT,'0.0.0.0');
   if (process.env.ADMIN_CHAT_ID) notifyAdmin();
+  deliverLessonReminders();
   start().catch(error=>{ console.error(error.message); process.exit(1); });
 }
 module.exports = { handle, server };
