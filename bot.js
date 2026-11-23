@@ -1,172 +1,168 @@
-/* ═══════════════════════════════════════════════════════════
-   LEXO BOT · сервер приёма оплаты Telegram Stars
-   Ноль зависимостей:  node bot.js   (Node 18+)
-   Переменные окружения:
-     BOT_TOKEN    — токен бота (НИКОМУ не показывай)
-     WEB_APP_URL  — адрес Mini App на Vercel
-     PORT         — порт (по умолчанию 8787)
-     PLUS_STARS   — цена Plus в звёздах (0 = активация бесплатно)
-     PRO_STARS    — цена Pro в звёздах (1 для теста)
-   ═══════════════════════════════════════════════════════════ */
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
+const http = require('node:http');
+const fs = require('node:fs');
+const path = require('node:path');
 
-const TOKEN = process.env.BOT_TOKEN || '';
-const WEB_APP_URL = process.env.WEB_APP_URL || 'https://lexo-11.vercel.app';
+const TOKEN = process.env.BOT_TOKEN;
 const PORT = Number(process.env.PORT || 8787);
-const DAYS = 30;
-const PRICES = {
-  plus: Number(process.env.PLUS_STARS ?? 0),
-  pro:  Number(process.env.PRO_STARS ?? 1)
-};
-if (!TOKEN) { console.error('❌ Нет BOT_TOKEN'); process.exit(1); }
+const WEB_APP_URL = 'https://lexo-11.vercel.app';
 
-const API = `https://api.telegram.org/bot${TOKEN}`;
-const call = async (method, payload = {}) => {
-  const res = await fetch(`${API}/${method}`, {
+async function telegram(method, payload = {}) {
+  const response = await fetch(`https://api.telegram.org/bot${TOKEN}/${method}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(35000)
   });
-  const json = await res.json();
-  if (!json.ok) throw new Error(`${method}: ${json.description}`);
-  return json.result;
-};
+  const data = await response.json();
+  if (!data.ok) throw new Error(`${method}: ${data.description}`);
+  return data.result;
+}
 
-/* ─────────── хранение подписок (файл data/subs.json) ─────────── */
-const DATA_DIR = path.join(__dirname, 'data');
-const SUBS_FILE = path.join(DATA_DIR, 'subs.json');
-const loadSubs = () => { try { return JSON.parse(fs.readFileSync(SUBS_FILE, 'utf8')); } catch (e) { return {}; } };
-const saveSubs = s => { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(SUBS_FILE, JSON.stringify(s, null, 2)); };
-const getSub = userId => {
-  const s = loadSubs()[String(userId)];
-  if (!s || (s.planUntil && Date.now() > s.planUntil)) return { plan: 'free', planUntil: null };
-  return s;
-};
-const setSub = (userId, plan) => {
-  const all = loadSubs();
-  all[String(userId)] = { plan, planUntil: plan === 'free' ? null : Date.now() + DAYS * 86400000 };
-  saveSubs(all);
-  return all[String(userId)];
-};
+const exercises = [
+  { word: 'on my way', example: 'I’m on my way. See you soon!', choices: ['Я уже в пути', 'Я скоро усну', 'Я дома'], correct: 0 },
+  { word: 'give it a try', example: 'I’ve never done it, but I’ll give it a try.', choices: ['Отдать это', 'Попробовать', 'Отказаться'], correct: 1 },
+  { word: 'sounds good', example: 'Meet at six? Sounds good!', choices: ['Слишком громко', 'Сомневаюсь', 'Отлично, договорились'], correct: 2 },
+  { word: 'catch up', example: 'Let’s catch up over coffee.', choices: ['Давай пообщаемся за кофе', 'Давай заварим кофе', 'Давай поторопимся'], correct: 0 },
+  { word: 'take your time', example: 'No rush. Take your time.', choices: ['Возьми часы', 'Не торопись', 'Поторопись'], correct: 1 },
+  { word: 'fair enough', example: 'You need another day? Fair enough.', choices: ['Это ярмарка', 'Совсем нет', 'Это понятно'], correct: 2 },
+  { word: 'keep in mind', example: 'Keep in mind that the shop closes at six.', choices: ['Имей в виду', 'Забудь об этом', 'Скажи громче'], correct: 0 }
+];
 
-/* ─────────── сообщения бота ─────────── */
-const sendStart = chatId => call('sendMessage', {
+const openButton = { text: '▶️ Открыть LEXO', web_app: { url: WEB_APP_URL } };
+const menu = [[openButton], [{ text: '🧩 Слово дня', callback_data: 'word' }]];
+const send = (chatId, text, keyboard = menu) => telegram('sendMessage', {
   chat_id: chatId,
-  text: '🦎 <b>LEXO</b> — английский с нуля прямо в Telegram.\n\n· 6 уровней от A1 до C2\n· слова, грамматика, письмо и живой сленг\n· умное повторение — слова не забываются\n· маскот Лекс, которого можно гладить\n\nЖми кнопку — и погнали!',
-  parse_mode: 'HTML',
-  reply_markup: { inline_keyboard: [[{ text: '▶️ Играть', web_app: { url: WEB_APP_URL } }]] }
+  text,
+  reply_markup: { inline_keyboard: keyboard }
 });
-const sendHelp = chatId => call('sendMessage', {
-  chat_id: chatId,
-  text: '❓ <b>Что умеет LEXO</b>\n\n/start — открыть приложение\n/plan — моя подписка\n\nВнутри приложения: уроки, умное повторение, ежедневные цели и подписки Plus/Pro за Telegram Stars.',
-  parse_mode: 'HTML',
-  reply_markup: { inline_keyboard: [[{ text: '▶️ Играть', web_app: { url: WEB_APP_URL } }]] }
+
+function sendWord(chatId) {
+  const date = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Moscow' }).format(new Date());
+  const day = Date.parse(date + 'T00:00:00Z') / 86400000;
+  const index = day % exercises.length;
+  const item = exercises[index];
+  return send(chatId,
+    `🧩 Слово дня — ${item.word}\n\n${item.example}\n\nКак перевести выражение?`,
+    [...item.choices.map((text, choice) => [{ text, callback_data: `word:${index}:${choice}` }]), [openButton]]
+  );
+}
+
+function getSub(userId) {
+  try {
+    const file = path.join(__dirname, 'data', 'subs.json');
+    const sub = JSON.parse(fs.readFileSync(file, 'utf8'))[String(userId)];
+    if (sub && ['plus', 'pro'].includes(sub.plan) && sub.planUntil > Date.now()) return sub;
+  } catch (error) {
+    if (error.code !== 'ENOENT') console.error('subs:', error.name);
+  }
+  return { plan: 'free', planUntil: null };
+}
+
+async function handle(update) {
+  if (update.pre_checkout_query) {
+    return telegram('answerPreCheckoutQuery', {
+      pre_checkout_query_id: update.pre_checkout_query.id,
+      ok: false,
+      error_message: 'Оплата LEXO пока отключена.'
+    });
+  }
+
+  const callback = update.callback_query;
+  if (callback) {
+    await telegram('answerCallbackQuery', { callback_query_id: callback.id });
+    const chat = callback.message?.chat;
+    if (chat?.type !== 'private') return;
+    if (callback.data === 'word') return sendWord(chat.id);
+
+    const match = /^word:([0-6]):([0-2])$/.exec(callback.data || '');
+    if (!match) return;
+    const item = exercises[Number(match[1])];
+    const correct = Number(match[2]) === item.correct;
+    return telegram('editMessageText', {
+      chat_id: chat.id,
+      message_id: callback.message.message_id,
+      text: `${correct ? '✅ Верно!' : '💡 Правильный ответ'}\n\n${item.word} — ${item.choices[item.correct]}.\n${item.example}`,
+      reply_markup: { inline_keyboard: [[openButton]] }
+    });
+  }
+
+  const message = update.message;
+  if (message?.chat.type !== 'private' || !message.text) return;
+  const chatId = message.chat.id;
+  switch (message.text.trim().split(/[\s@]/)[0]) {
+    case '/word':
+      return sendWord(chatId);
+    case '/help':
+      return send(chatId, '🦎 /start — открыть LEXO\n/word — слово дня\n/plan — подписки');
+    case '/plan':
+      return send(chatId, 'Plus и Pro пока можно активировать бесплатно на 30 дней прямо в LEXO.');
+    default:
+      return send(chatId, '🦎 Привет! Я Лекс. Практикуй английский в Mini App или попробуй задание дня прямо здесь.');
+  }
+}
+
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url, 'http://localhost');
+  let status = 404;
+  let body = { error: 'not found' };
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+  if (req.method === 'GET' && url.pathname === '/health') {
+    status = 200;
+    body = { ok: true, paymentsEnabled: false };
+  } else if (req.method === 'GET' && url.pathname === '/api/plan') {
+    const id = url.searchParams.get('userId');
+    status = id && /^\d+$/.test(id) ? 200 : 400;
+    body = status === 200 ? getSub(id) : { error: 'valid userId required' };
+  } else if (url.pathname === '/api/invoice') {
+    status = 503;
+    body = { error: 'payments_disabled' };
+  }
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(body));
 });
-const sendPlan = chatId => {
-  const s = getSub(chatId);
-  const when = s.planUntil ? new Date(s.planUntil).toLocaleDateString('ru-RU') : '—';
-  return call('sendMessage', {
-    chat_id: chatId,
-    text: `💳 Твоя подписка: <b>LEXO ${s.plan.toUpperCase()}</b>${s.planUntil ? `\nДействует до: ${when}` : '\nБесплатный тариф'}`,
-    parse_mode: 'HTML'
-  });
-};
 
-/* ─────────── приём обновлений (long polling) ─────────── */
-const handle = async u => {
-  if (u.message && u.message.text) {
-    const txt = u.message.text.trim();
-    const id = u.message.chat.id;
-    if (txt === '/start') return sendStart(id);
-    if (txt === '/help') return sendHelp(id);
-    if (txt === '/plan') return sendPlan(id);
-    return sendStart(id);
-  }
-  /* подтверждение чекаута — обязательно, иначе платёж зависнет */
-  if (u.pre_checkout_query) {
-    return call('answerPreCheckoutQuery', { pre_checkout_query_id: u.pre_checkout_query.id, ok: true });
-  }
-  /* оплата прошла */
-  if (u.message && u.message.successful_payment) {
-    const sp = u.message.successful_payment;
-    const [plan, userId] = String(sp.invoice_payload || '').split(':');
-    if (!plan || !userId || !PRICES.hasOwnProperty(plan)) return;
-    const sub = setSub(userId, plan);
-    try {
-      await call('sendMessage', {
-        chat_id: userId,
-        text: `🎉 Оплата получена! <b>LEXO ${plan.toUpperCase()}</b> активен до ${new Date(sub.planUntil).toLocaleDateString('ru-RU')}.\nОткрой приложение — всё уже включено.`,
-        parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [[{ text: '▶️ Играть', web_app: { url: WEB_APP_URL } }]] }
-      });
-    } catch (e) { /* пользователь не нажал /start — не страшно, подписка уже записана */ }
-  }
-};
-
-let offset = 0;
-const poll = async () => {
+async function start() {
+  await telegram('deleteWebhook');
+  let offset = 0;
   while (true) {
     try {
-      const upd = await call('getUpdates', { offset, timeout: 25, allowed_updates: ['message', 'pre_checkout_query'] });
-      for (const u of upd) {
-        offset = u.update_id + 1;
-        try { await handle(u); } catch (e) { console.error('handler:', e.message); }
+      const updates = await telegram('getUpdates', {
+        offset,
+        timeout: 25,
+        allowed_updates: ['message', 'callback_query', 'pre_checkout_query']
+      });
+      for (const update of updates) {
+        offset = update.update_id + 1;
+        try {
+          await handle(update);
+        } catch (error) {
+          console.error('Update:', error.message);
+        }
       }
-    } catch (e) {
-      console.error('poll:', e.message);
-      await new Promise(r => setTimeout(r, 3000));
+    } catch (error) {
+      console.error('Polling:', error.message);
+      await new Promise(resolve => setTimeout(resolve, 3000));
     }
   }
-};
+}
 
-/* ─────────── HTTP API для Mini App ─────────── */
-const server = http.createServer(async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
-  const url = new URL(req.url, 'http://localhost');
-  const send = (obj, code = 200) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
-
-  if (url.pathname === '/health') return send({ ok: true, prices: PRICES });
-
-  if (url.pathname === '/api/plan') {
-    const userId = url.searchParams.get('userId');
-    if (!userId) return send({ error: 'userId required' }, 400);
-    return send(getSub(userId));
+if (require.main === module) {
+  if (!TOKEN) {
+    console.error('Нет BOT_TOKEN');
+    process.exit(1);
   }
+  server.listen(PORT, '0.0.0.0');
+  start().catch(error => {
+    console.error(error.message);
+    process.exit(1);
+  });
+}
 
-  if (url.pathname === '/api/invoice') {
-    const plan = url.searchParams.get('plan');
-    const userId = url.searchParams.get('userId');
-    if (!plan || !userId) return send({ error: 'plan & userId required' }, 400);
-    const stars = PRICES[plan];
-    if (stars === undefined) return send({ error: 'unknown plan' }, 400);
-    /* цена 0 = промо-активация без платежа */
-    if (stars <= 0) return send({ granted: true, sub: setSub(userId, plan) });
-    try {
-      const link = await call('createInvoiceLink', {
-        title: `LEXO ${plan === 'plus' ? 'Plus' : 'Pro'}`,
-        description: plan === 'plus'
-          ? '30 дней: сленг, умное повторение без лимита, 4 урока в день, 3 сердечка'
-          : '30 дней: всё из Plus + Dynamic Context, безлимит уроков и все уровни',
-        payload: `${plan}:${userId}`,
-        currency: 'XTR',
-        prices: [{ label: `LEXO ${plan.toUpperCase()} · 30 дней`, amount: stars }]
-      });
-      return send({ link });
-    } catch (e) { return send({ error: e.message }, 500); }
-  }
-
-  return send({ error: 'not found' }, 404);
-});
-
-(async () => {
-  try { await call('deleteWebhook', {}); } catch (e) {}
-  const me = await call('getMe');
-  console.log(`🦎 LEXO bot @${me.username} запущен · API на порту ${PORT} · цены: plus=${PRICES.plus}⭐ pro=${PRICES.pro}⭐`);
-  server.listen(PORT);
-  poll();
-})();
+module.exports = { handle, server };
