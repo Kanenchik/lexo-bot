@@ -33,8 +33,78 @@ const send = (chatId, text, keyboard = menu) => telegram('sendMessage', {
 
 const adminMenu = [
   [{text:'📊 Статистика',callback_data:'admin:stats'},{text:'🎟 Промокоды',callback_data:'admin:promos'}],
+  [{text:'📬 Обращения',callback_data:'admin:feedback:open:0'},{text:'📈 Активность',callback_data:'admin:activity'}],
   [{text:'➕ Создать промокод',callback_data:'admin:create'}]
 ];
+
+
+const feedbackLabels = {bug:'Ошибка',idea:'Идея',payment:'Оплата'};
+const moscowDate = new Intl.DateTimeFormat('ru-RU',{timeZone:'Europe/Moscow',dateStyle:'short',timeStyle:'short'});
+
+async function feedbackList(chatId, resolved, page) {
+  const filter = resolved ? 'resolved_at IS NOT NULL' : 'resolved_at IS NULL';
+  const {rows} = await db.query(`SELECT id,kind,body FROM public.lexo_feedback
+    WHERE ${filter} ORDER BY id DESC LIMIT 6 OFFSET $1`,[page*5]);
+  const buttons = rows.slice(0,5).map(row=>[{text:'#'+row.id+' · '+feedbackLabels[row.kind]+' · '+Array.from(row.body.replace(/\s+/g,' ').trim()).slice(0,36).join(''),
+    callback_data:'admin:ticket:'+row.id}]);
+  const queue = resolved ? 'closed' : 'open';
+  const pages = [];
+  if (page>0) pages.push({text:'← Назад',callback_data:'admin:feedback:'+queue+':'+(page-1)});
+  if (rows.length>5) pages.push({text:'Далее →',callback_data:'admin:feedback:'+queue+':'+(page+1)});
+  if (pages.length) buttons.push(pages);
+  buttons.push([{text:resolved?'Открытые':'Решённые',callback_data:'admin:feedback:'+(resolved?'open':'closed')+':0'},
+    {text:'В админ-панель',callback_data:'admin:menu'}]);
+  return send(chatId,(resolved?'✅ Решённые обращения':'📬 Открытые обращения')+(rows.length?' · стр. '+(page+1):'\nНа этой странице обращений нет.'),buttons);
+}
+
+async function feedbackTicket(chatId, id, status) {
+  if (status) {
+    await db.query(`UPDATE public.lexo_feedback SET resolved_at =
+      CASE WHEN $2 THEN coalesce(resolved_at,now()) ELSE NULL END WHERE id=$1`,[id,status==='close']);
+  }
+  const {rows:[row]} = await db.query('SELECT id,kind,body,created_at,resolved_at FROM public.lexo_feedback WHERE id=$1',[id]);
+  if (!row) return send(chatId,'Обращение не найдено.',adminMenu);
+  const resolved = Boolean(row.resolved_at);
+  return send(chatId,['#'+row.id+' · '+feedbackLabels[row.kind],moscowDate.format(row.created_at),
+    resolved?'Статус: решено':'Статус: открыто','',row.body].join('\n'),[
+    [{text:resolved?'Открыть снова':'Отметить решённым',callback_data:'admin:'+(resolved?'reopen':'close')+':'+row.id}],
+    [{text:'К списку',callback_data:'admin:feedback:'+(resolved?'closed':'open')+':0'}]
+  ]);
+}
+
+async function lessonActivity(chatId) {
+  const {rows:[s]} = await db.query(`WITH days AS (
+    SELECT (now() AT TIME ZONE 'Europe/Moscow')::date - n AS day FROM generate_series(0,6) n
+  ), activity AS (
+    SELECT d.day,p.profile_id FROM days d JOIN public.user_progress p
+      ON p.last_activity_date=d.day OR (p.app_state->'studyDays') ? d.day::text
+  ), daily AS (
+    SELECT d.day,count(a.profile_id) AS students FROM days d LEFT JOIN activity a USING(day) GROUP BY d.day
+  )
+  SELECT (SELECT count(DISTINCT profile_id) FROM activity) AS active,
+    (SELECT count(*) FROM public.user_progress WHERE lessons_completed>0) AS ever,
+    (SELECT count(*) FROM public.profiles) AS total,
+    (SELECT string_agg(to_char(day,'DD.MM') || ' — ' || students,chr(10) ORDER BY day DESC) FROM daily) AS daily`);
+  return send(chatId,['📈 Завершение уроков','Учеников с пройденными уроками за 7 дней: '+s.active,
+    'Хотя бы один урок за всё время: '+s.ever+' из '+s.total,'','Учеников по дням (МСК)',s.daily].join('\n'),adminMenu);
+}
+
+function expiryFromDate(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const date = new Date(value+'T00:00:00.000Z');
+  if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0,10) !== value) return null;
+  return new Date(date.getTime() + 21*60*60*1000);
+}
+
+async function adminCallback(chatId, data) {
+  const [,action,arg,rawPage] = data.split(':');
+  if (['stats','promos','create','menu'].includes(action)) return adminAction(chatId,action);
+  if (action==='activity') return lessonActivity(chatId);
+  if (action==='feedback' && ['open','closed'].includes(arg) && /^\d{1,6}$/.test(rawPage || ''))
+    return feedbackList(chatId,arg==='closed',Number(rawPage));
+  if (['ticket','close','reopen'].includes(action) && /^[1-9]\d{0,17}$/.test(arg || ''))
+    return feedbackTicket(chatId,arg,action==='ticket'?null:action);
+}
 
 function isAdmin(user, chat) {
   const adminId = (process.env.ADMIN_USER_ID || process.env.ADMIN_CHAT_ID || '').trim();
@@ -60,14 +130,15 @@ async function adminAction(chatId, action, args = []) {
       'Подтверждённые покупки: '+s.payments,'Обращения: '+s.feedback].join('\n'));
   }
   if (action === 'promos') {
-    const {rows} = await db.query(`SELECT p.code,p.days,p.enabled,p.new_only,
+    const {rows} = await db.query(`SELECT p.code,p.days,p.enabled,p.new_only,p.max_uses,p.expires_at,
       (SELECT count(*) FROM public.lexo_redemptions r WHERE r.code=p.code) AS uses
       FROM public.lexo_promos p ORDER BY p.enabled DESC,p.code LIMIT 21`);
     const lines = rows.slice(0,20).map(p=> (p.enabled?'🟢 ':'⚪ ') + p.code.slice(0,32) +
-      ' · '+p.days+' дн. · активаций: '+p.uses+(p.new_only?' · для новых':''));
+      ' · '+p.days+' дн. · активаций: '+p.uses+(p.max_uses?'/'+p.max_uses:'')+
+      (p.new_only?' · для новых':'')+(p.expires_at?' · истекает '+moscowDate.format(p.expires_at)+' МСК':''));
     if (rows.length>20) lines.push('Показаны первые 20 кодов.');
     if (!lines.length) lines.push('Промокодов пока нет.');
-    return reply([...lines,'','Отключить: /promo_off КОД','Включить снова: /promo_on КОД'].join('\n'));
+    return reply([...lines,'','Отключить: /promo_off КОД','Включить снова: /promo_on КОД','Лимит и дата: /promo_limits КОД 10 YYYY-MM-DD','Дата включительно по МСК. Поставь - вместо лимита или даты, чтобы снять ограничение.'].join('\n'));
   }
   const [raw = '', days, scope] = args;
   const code = raw.toLowerCase();
@@ -78,6 +149,15 @@ async function adminAction(chatId, action, args = []) {
     const result = await db.query(`INSERT INTO public.lexo_promos(code,days,new_only)
       VALUES ($1,$2,$3) ON CONFLICT (code) DO NOTHING`,[code,Number(days),scope==='new']);
     return reply(result.rowCount ? 'Промокод '+code+' создан. Plus на '+Number(days)+' дн.' : 'Код '+code+' уже существует.');
+  }
+  if (action === 'limits') {
+    const expire = scope && scope !== '-' ? expiryFromDate(scope) : null;
+    const validLimit = days === '-' || (/^\d{1,7}$/.test(days || '') && Number(days)>0);
+    if (args.length!==3 || !validLimit || (scope!=='-' && (!expire || expire<=new Date())))
+      return reply('Формат: /promo_limits КОД 10 YYYY-MM-DD. Выбери будущий срок или сегодняшнюю дату. Знак - снимает ограничение в соответствующем поле.');
+    const result = await db.query('UPDATE public.lexo_promos SET max_uses=$2,expires_at=$3 WHERE code=$1',
+      [code,days==='-'?null:Number(days),expire]);
+    return reply(result.rowCount ? 'Ограничения для '+code+' сохранены. Уже выданные дни Plus сохраняются.' : 'Код не найден.');
   }
   if (action === 'off' || action === 'on') {
     if (args.length!==1) return reply('Укажи один код.');
@@ -108,8 +188,8 @@ async function handle(update) {
     await telegram('answerCallbackQuery', { callback_query_id:callback.id });
     const chat = callback.message?.chat;
     if (chat?.type !== 'private') return;
-    if (/^admin:(stats|promos|create)$/.test(callback.data || '')) {
-      if (isAdmin(callback.from,chat)) return adminAction(chat.id,callback.data.split(':')[1]);
+    if (callback.data?.startsWith('admin:')) {
+      if (isAdmin(callback.from,chat)) return adminCallback(chat.id,callback.data);
       return;
     }
     if (callback.data === 'word') return sendWord(chat.id);
@@ -137,9 +217,10 @@ async function handle(update) {
       return;
     case '/promo_create':
     case '/promo_off':
-    case '/promo_on': {
+    case '/promo_on':
+    case '/promo_limits': {
       if (!isAdmin(message.from,message.chat)) return;
-      const actions = {'/promo_create':'save','/promo_off':'off','/promo_on':'on'};
+      const actions = {'/promo_create':'save','/promo_off':'off','/promo_on':'on','/promo_limits':'limits'};
       return adminAction(chatId,actions[command.split('@')[0]],args);
     }
     case '/channel': return send(chatId,'Новости и обновления LEXO',[[channelButton]]);
@@ -231,3 +312,4 @@ if (require.main === module) {
   start().catch(error=>{ console.error(error.message); process.exit(1); });
 }
 module.exports = { handle, server };
+

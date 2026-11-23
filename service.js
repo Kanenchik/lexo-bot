@@ -81,12 +81,17 @@ async function api(route,u,b,tg) {
         WHERE profile_id=$1 AND (plus_until IS NULL OR plus_until<=now())`,[id]);
     } else if (route === 'promo') {
       const code = String(b.code || '').trim().toLowerCase();
-      const {rows:[promo]} = await c.query(`SELECT days, new_only, p.created_at >= now()-interval '24 hours' AS fresh
-        FROM public.lexo_promos, public.profiles p WHERE code=$1 AND enabled AND p.id=$2`,[code,id]);
+      const {rows:[promo]} = await c.query(`SELECT days, new_only, max_uses, expires_at <= now() AS expired, p.created_at >= now()-interval '24 hours' AS fresh
+        FROM public.lexo_promos, public.profiles p WHERE code=$1 AND enabled AND p.id=$2 FOR UPDATE OF lexo_promos`,[code,id]);
       if (!promo) fail(404,'Промокод не найден.');
       if (promo.new_only && !promo.fresh) fail(400,'Этот код доступен в первые 24 часа после регистрации.');
+      if (promo.expired) fail(400,'Срок действия промокода истёк.');
       const used = await c.query('INSERT INTO public.lexo_redemptions(profile_id,code) VALUES($1,$2) ON CONFLICT DO NOTHING',[id,code]);
       if (!used.rowCount) fail(409,'Этот код уже использован.');
+      if (promo.max_uses !== null) {
+        const {rows:[{uses}]} = await c.query('SELECT count(*) AS uses FROM public.lexo_redemptions WHERE code=$1',[code]);
+        if (Number(uses)>promo.max_uses) fail(409,'Лимит активаций промокода исчерпан.');
+      }
       await c.query("UPDATE public.lexo_access SET plus_until=greatest(now(),plus_until)+$2*interval '24 hours' WHERE profile_id=$1",[id,promo.days]);
     } else if (route === 'invoice') {
       const {rows:[order]} = await c.query('INSERT INTO public.lexo_orders(profile_id) VALUES($1) RETURNING id',[id]);
@@ -130,3 +135,4 @@ async function deliver(tg,admin) {
   });
 }
 module.exports = {authenticate,api,payment,deliver,db};
+
